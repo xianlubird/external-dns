@@ -98,11 +98,11 @@ func (im *TXTRegistry) Records() ([]*endpoint.Endpoint, error) {
 	}
 
 	for _, ep := range endpoints {
+		ep.Labels = endpoint.NewLabels()
 		if labels, ok := labelMap[ep.DNSName]; ok {
-			ep.Labels = labels
-		} else {
-			//this indicates that owner could not be identified, as there is no corresponding TXT record
-			ep.Labels = endpoint.NewLabels()
+			for k, v := range labels {
+				ep.Labels[k] = v
+			}
 		}
 	}
 
@@ -125,6 +125,9 @@ func (im *TXTRegistry) ApplyChanges(changes *plan.Changes) error {
 		Delete:    filterOwnedRecords(im.ownerID, changes.Delete),
 	}
 	for _, r := range filteredChanges.Create {
+		if r.Labels == nil {
+			r.Labels = make(map[string]string)
+		}
 		r.Labels[endpoint.OwnerLabelKey] = im.ownerID
 		txt := endpoint.NewEndpoint(im.mapper.toTXTName(r.DNSName), endpoint.RecordTypeTXT, r.Labels.Serialize(true))
 		filteredChanges.Create = append(filteredChanges.Create, txt)

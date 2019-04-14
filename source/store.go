@@ -27,6 +27,8 @@ import (
 
 	"github.com/linki/instrumented_http"
 	log "github.com/sirupsen/logrus"
+	istiocrd "istio.io/istio/pilot/pkg/config/kube/crd"
+	istiomodel "istio.io/istio/pilot/pkg/model"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -36,19 +38,27 @@ var ErrSourceNotFound = errors.New("source not found")
 
 // Config holds shared configuration options for all Sources.
 type Config struct {
-	Namespace                string
-	AnnotationFilter         string
-	FQDNTemplate             string
-	CombineFQDNAndAnnotation bool
-	Compatibility            string
-	PublishInternal          bool
-	PublishHostIP            bool
-	ConnectorServer          string
+	Namespace                   string
+	AnnotationFilter            string
+	FQDNTemplate                string
+	CombineFQDNAndAnnotation    bool
+	IgnoreHostnameAnnotation    bool
+	Compatibility               string
+	PublishInternal             bool
+	PublishHostIP               bool
+	ConnectorServer             string
+	CRDSourceAPIVersion         string
+	CRDSourceKind               string
+	KubeConfig                  string
+	KubeMaster                  string
+	ServiceTypeFilter           []string
+	IstioIngressGatewayServices []string
 }
 
 // ClientGenerator provides clients
 type ClientGenerator interface {
 	KubeClient() (kubernetes.Interface, error)
+	IstioClient() (istiomodel.ConfigStore, error)
 }
 
 // SingletonClientGenerator stores provider clients and guarantees that only one instance of client
@@ -57,17 +67,28 @@ type SingletonClientGenerator struct {
 	KubeConfig     string
 	KubeMaster     string
 	RequestTimeout time.Duration
-	client         kubernetes.Interface
-	sync.Once
+	kubeClient     kubernetes.Interface
+	istioClient    istiomodel.ConfigStore
+	kubeOnce       sync.Once
+	istioOnce      sync.Once
 }
 
 // KubeClient generates a kube client if it was not created before
 func (p *SingletonClientGenerator) KubeClient() (kubernetes.Interface, error) {
 	var err error
-	p.Once.Do(func() {
-		p.client, err = NewKubeClient(p.KubeConfig, p.KubeMaster, p.RequestTimeout)
+	p.kubeOnce.Do(func() {
+		p.kubeClient, err = NewKubeClient(p.KubeConfig, p.KubeMaster, p.RequestTimeout)
 	})
-	return p.client, err
+	return p.kubeClient, err
+}
+
+// IstioClient generates an istio client if it was not created before
+func (p *SingletonClientGenerator) IstioClient() (istiomodel.ConfigStore, error) {
+	var err error
+	p.istioOnce.Do(func() {
+		p.istioClient, err = NewIstioClient(p.KubeConfig)
+	})
+	return p.istioClient, err
 }
 
 // ByNames returns multiple Sources given multiple names.
@@ -92,17 +113,37 @@ func BuildWithConfig(source string, p ClientGenerator, cfg *Config) (Source, err
 		if err != nil {
 			return nil, err
 		}
-		return NewServiceSource(client, cfg.Namespace, cfg.AnnotationFilter, cfg.FQDNTemplate, cfg.CombineFQDNAndAnnotation, cfg.Compatibility, cfg.PublishInternal, cfg.PublishHostIP)
+		return NewServiceSource(client, cfg.Namespace, cfg.AnnotationFilter, cfg.FQDNTemplate, cfg.CombineFQDNAndAnnotation, cfg.Compatibility, cfg.PublishInternal, cfg.PublishHostIP, cfg.ServiceTypeFilter, cfg.IgnoreHostnameAnnotation)
 	case "ingress":
 		client, err := p.KubeClient()
 		if err != nil {
 			return nil, err
 		}
-		return NewIngressSource(client, cfg.Namespace, cfg.AnnotationFilter, cfg.FQDNTemplate, cfg.CombineFQDNAndAnnotation)
+		return NewIngressSource(client, cfg.Namespace, cfg.AnnotationFilter, cfg.FQDNTemplate, cfg.CombineFQDNAndAnnotation, cfg.IgnoreHostnameAnnotation)
+	case "istio-gateway":
+		kubernetesClient, err := p.KubeClient()
+		if err != nil {
+			return nil, err
+		}
+		istioClient, err := p.IstioClient()
+		if err != nil {
+			return nil, err
+		}
+		return NewIstioGatewaySource(kubernetesClient, istioClient, cfg.IstioIngressGatewayServices, cfg.Namespace, cfg.AnnotationFilter, cfg.FQDNTemplate, cfg.CombineFQDNAndAnnotation, cfg.IgnoreHostnameAnnotation)
 	case "fake":
 		return NewFakeSource(cfg.FQDNTemplate)
 	case "connector":
 		return NewConnectorSource(cfg.ConnectorServer)
+	case "crd":
+		client, err := p.KubeClient()
+		if err != nil {
+			return nil, err
+		}
+		crdClient, scheme, err := NewCRDClientForAPIVersionKind(client, cfg.KubeConfig, cfg.KubeMaster, cfg.CRDSourceAPIVersion, cfg.CRDSourceKind)
+		if err != nil {
+			return nil, err
+		}
+		return NewCRDSource(crdClient, cfg.Namespace, cfg.CRDSourceKind, scheme)
 	}
 	return nil, ErrSourceNotFound
 }
@@ -138,7 +179,37 @@ func NewKubeClient(kubeConfig, kubeMaster string, requestTimeout time.Duration) 
 		return nil, err
 	}
 
-	log.Infof("Connected to cluster at %s", config.Host)
+	log.Infof("Created Kubernetes client %s", config.Host)
+
+	return client, nil
+}
+
+// NewIstioClient returns a new Istio client object. It uses the configured
+// KubeConfig attribute to connect to the cluster. If KubeConfig isn't provided
+// it defaults to using the recommended default.
+// NB: Istio controls the creation of the underlying Kubernetes client, so we
+// have no ability to tack on transport wrappers (e.g., Prometheus request
+// wrappers) to the client's config at this level. Furthermore, the Istio client
+// constructor does not expose the ability to override the Kubernetes master,
+// so the Master config attribute has no effect.
+func NewIstioClient(kubeConfig string) (*istiocrd.Client, error) {
+	if kubeConfig == "" {
+		if _, err := os.Stat(clientcmd.RecommendedHomeFile); err == nil {
+			kubeConfig = clientcmd.RecommendedHomeFile
+		}
+	}
+
+	client, err := istiocrd.NewClient(
+		kubeConfig,
+		"",
+		istiomodel.ConfigDescriptor{istiomodel.Gateway},
+		"",
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Info("Created Istio client")
 
 	return client, nil
 }

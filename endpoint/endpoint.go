@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -107,18 +109,31 @@ func (t Targets) IsLess(o Targets) bool {
 	return false
 }
 
+// ProviderSpecificProperty holds the name and value of a configuration which is specific to individual DNS providers
+type ProviderSpecificProperty struct {
+	Name  string `json:"name,omitempty"`
+	Value string `json:"value,omitempty"`
+}
+
+// ProviderSpecific holds configuration which is specific to individual DNS providers
+type ProviderSpecific []ProviderSpecificProperty
+
 // Endpoint is a high-level way of a connection between a service and an IP
 type Endpoint struct {
 	// The hostname of the DNS record
-	DNSName string
+	DNSName string `json:"dnsName,omitempty"`
 	// The targets the DNS record points to
-	Targets Targets
-	// RecordType type of record, e.g. CNAME, A, TXT etc
-	RecordType string
+	Targets Targets `json:"targets,omitempty"`
+	// RecordType type of record, e.g. CNAME, A, SRV, TXT etc
+	RecordType string `json:"recordType,omitempty"`
 	// TTL for the record
-	RecordTTL TTL
+	RecordTTL TTL `json:"recordTTL,omitempty"`
 	// Labels stores labels defined for the Endpoint
-	Labels Labels
+	// +optional
+	Labels Labels `json:"labels,omitempty"`
+	// ProviderSpecific stores provider specific config
+	// +optional
+	ProviderSpecific ProviderSpecific `json:"providerSpecific,omitempty"`
 }
 
 // NewEndpoint initialization method to be used to create an endpoint
@@ -142,6 +157,65 @@ func NewEndpointWithTTL(dnsName, recordType string, ttl TTL, targets ...string) 
 	}
 }
 
+// WithProviderSpecific attaches a key/value pair to the Endpoint and returns the Endpoint.
+// This can be used to pass additional data through the stages of ExternalDNS's Endpoint processing.
+// The assumption is that most of the time this will be provider specific metadata that doesn't
+// warrant its own field on the Endpoint object itself. It differs from Labels in the fact that it's
+// not persisted in the Registry but only kept in memory during a single record synchronization.
+func (e *Endpoint) WithProviderSpecific(key, value string) *Endpoint {
+	if e.ProviderSpecific == nil {
+		e.ProviderSpecific = ProviderSpecific{}
+	}
+
+	e.ProviderSpecific = append(e.ProviderSpecific, ProviderSpecificProperty{Name: key, Value: value})
+	return e
+}
+
+// GetProviderSpecificProperty returns a ProviderSpecificProperty if the property exists.
+func (e *Endpoint) GetProviderSpecificProperty(key string) (ProviderSpecificProperty, bool) {
+	for _, providerSpecific := range e.ProviderSpecific {
+		if providerSpecific.Name == key {
+			return providerSpecific, true
+		}
+	}
+	return ProviderSpecificProperty{}, false
+}
+
 func (e *Endpoint) String() string {
-	return fmt.Sprintf("%s %d IN %s %s", e.DNSName, e.RecordTTL, e.RecordType, e.Targets)
+	return fmt.Sprintf("%s %d IN %s %s %s", e.DNSName, e.RecordTTL, e.RecordType, e.Targets, e.ProviderSpecific)
+}
+
+// DNSEndpointSpec defines the desired state of DNSEndpoint
+type DNSEndpointSpec struct {
+	Endpoints []*Endpoint `json:"endpoints,omitempty"`
+}
+
+// DNSEndpointStatus defines the observed state of DNSEndpoint
+type DNSEndpointStatus struct {
+	// The generation observed by the external-dns controller.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+}
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// DNSEndpoint is a contract that a user-specified CRD must implement to be used as a source for external-dns.
+// The user-specified CRD should also have the status sub-resource.
+// +k8s:openapi-gen=true
+// +kubebuilder:resource:path=dnsendpoints
+// +kubebuilder:subresource:status
+type DNSEndpoint struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   DNSEndpointSpec   `json:"spec,omitempty"`
+	Status DNSEndpointStatus `json:"status,omitempty"`
+}
+
+// DNSEndpointList is a list of DNSEndpoint objects
+type DNSEndpointList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []DNSEndpoint `json:"items"`
 }

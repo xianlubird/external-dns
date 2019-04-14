@@ -17,6 +17,7 @@ limitations under the License.
 package testutils
 
 import (
+	"reflect"
 	"sort"
 
 	"github.com/kubernetes-incubator/external-dns/endpoint"
@@ -48,7 +49,8 @@ func (b byAllFields) Less(i, j int) bool {
 func SameEndpoint(a, b *endpoint.Endpoint) bool {
 	return a.DNSName == b.DNSName && a.Targets.Same(b.Targets) && a.RecordType == b.RecordType &&
 		a.Labels[endpoint.OwnerLabelKey] == b.Labels[endpoint.OwnerLabelKey] && a.RecordTTL == b.RecordTTL &&
-		a.Labels[endpoint.ResourceLabelKey] == b.Labels[endpoint.ResourceLabelKey]
+		a.Labels[endpoint.ResourceLabelKey] == b.Labels[endpoint.ResourceLabelKey] &&
+		SameProverSpecific(a.ProviderSpecific, b.ProviderSpecific)
 }
 
 // SameEndpoints compares two slices of endpoints regardless of order
@@ -78,4 +80,9 @@ func SameEndpoints(a, b []*endpoint.Endpoint) bool {
 func SamePlanChanges(a, b map[string][]*endpoint.Endpoint) bool {
 	return SameEndpoints(a["Create"], b["Create"]) && SameEndpoints(a["Delete"], b["Delete"]) &&
 		SameEndpoints(a["UpdateOld"], b["UpdateOld"]) && SameEndpoints(a["UpdateNew"], b["UpdateNew"])
+}
+
+// SameProverSpecific verifies that two maps contain the same string/string key/value pairs
+func SameProverSpecific(a, b endpoint.ProviderSpecific) bool {
+	return reflect.DeepEqual(a, b)
 }
